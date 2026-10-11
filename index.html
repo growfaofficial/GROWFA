@@ -2430,7 +2430,13 @@ async function loadGrowfaSharedContent(options = {}) {
     for (const key of GROWFA_SHARED_CONTENT_KEYS) {
       if (remote.has(key)) {
         const value = remote.get(key);
-        try { localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value)); } catch (_) {}
+        try {
+          // Keep the pre-Supabase browser copy recoverable before adopting the shared version.
+          const localValue = localStorage.getItem(key);
+          const backupKey = 'growfa_pre_supabase_backup_' + key;
+          if (localValue !== null && localStorage.getItem(backupKey) === null) localStorage.setItem(backupKey, localValue);
+          localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value));
+        } catch (_) {}
       } else if (options.migrateMissing && growfaCanSyncSharedContent()) {
         const localValue = safeStorageGet(key);
         if (localValue !== null) await persistGrowfaContent(key, localValue);
@@ -2490,6 +2496,7 @@ let currentArticleViewMode = 'read'; // 'read' or 'download'
 // Initialize the website
 document.addEventListener('DOMContentLoaded', async function() {
 await loadGrowfaSharedContent();
+loadGrowfaBackgroundFromStorage();
 initializeLocalStorage();
 loadWebsiteContent();
 createBackgroundElements();
@@ -2667,6 +2674,7 @@ loginBtn.addEventListener('click', async function() {
     }
     growfaAdminSession = data.session;
     await loadGrowfaSharedContent({ migrateMissing: true });
+    loadGrowfaBackgroundFromStorage();
     loadWebsiteContent();
     loginModal.style.display = 'none';
     adminPortal.style.display = 'block';
@@ -4554,6 +4562,13 @@ const backgroundOverlayInput = document.getElementById('adminBackgroundOverlay')
 const backgroundOverlayValue = document.getElementById('adminBackgroundOverlayValue');
 const backgroundPreview = document.getElementById('adminBackgroundPreview');
 const DEFAULT_GROWFA_BG = 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?auto=format&fit=crop&w=1920&q=80';
+function loadGrowfaBackgroundFromStorage() {
+  try {
+    const savedBg = JSON.parse(localStorage.getItem('growfaWebsiteBackground') || 'null');
+    if (savedBg && savedBg.url) applyGrowfaBackground(savedBg.url, savedBg.overlay, false);
+    else applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false);
+  } catch (err) { applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); }
+}
 function applyGrowfaBackground(url, overlay, persist) {
   const safeUrl = /^https?:\/\//i.test(url || '') ? url : DEFAULT_GROWFA_BG;
   const amount = Math.max(.25, Math.min(.92, Number(overlay) || .78));
@@ -4563,13 +4578,37 @@ function applyGrowfaBackground(url, overlay, persist) {
   if (backgroundUrlInput) backgroundUrlInput.value = safeUrl;
   if (backgroundOverlayInput) backgroundOverlayInput.value = String(amount);
   if (backgroundOverlayValue) backgroundOverlayValue.textContent = Math.round(amount * 100) + '%';
-  if (persist) { try { const saved = JSON.stringify({url:safeUrl, overlay:amount}); localStorage.setItem('growfaWebsiteBackground', saved); if (growfaCanSyncSharedContent()) void persistGrowfaContent('growfaWebsiteBackground', saved); } catch (err) { alert('Background applied for this visit, but browser storage is unavailable.'); } }
+  if (persist) {
+    try { localStorage.setItem('growfaWebsiteBackground', JSON.stringify({url:safeUrl, overlay:amount})); }
+    catch (err) { alert('Background preview applied, but browser storage is unavailable.'); }
+  }
 }
-try { const savedBg = JSON.parse(localStorage.getItem('growfaWebsiteBackground') || 'null'); if (savedBg && savedBg.url) applyGrowfaBackground(savedBg.url, savedBg.overlay, false); else applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); } catch (err) { applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); }
-if (backgroundForm) backgroundForm.addEventListener('submit', function(e) { e.preventDefault(); const url = backgroundUrlInput.value.trim(); if (!/^https?:\/\//i.test(url)) { alert('Please enter a valid image URL beginning with https:// or http://.'); return; } applyGrowfaBackground(url, backgroundOverlayInput.value, true); alert('Background applied. It is saved in this browser only until Supabase is connected.'); });
+loadGrowfaBackgroundFromStorage();
+if (backgroundForm) backgroundForm.addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const url = backgroundUrlInput.value.trim();
+  if (!/^https?:\/\//i.test(url)) { alert('Please enter a valid image URL beginning with https:// or http://.'); return; }
+  if (!growfaCanSyncSharedContent()) { alert('Please sign in to the GROWFA admin portal before saving a shared background. The preview will not be published until you sign in.'); return; }
+  const saved = JSON.stringify({url:url, overlay:Number(backgroundOverlayInput.value)});
+  applyGrowfaBackground(url, backgroundOverlayInput.value, true);
+  const submitButton = backgroundForm.querySelector('button[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
+  try {
+    const ok = await persistGrowfaContent('growfaWebsiteBackground', saved);
+    if (!ok) throw new Error('Supabase did not confirm the background save.');
+    alert('Background saved to Supabase. It will be shared with other devices after they reload the website.');
+  } catch (err) { alert('Background was previewed but not published. ' + (err.message || 'Please try again.')); }
+  finally { if (submitButton) submitButton.disabled = false; }
+});
 if (backgroundOverlayInput) backgroundOverlayInput.addEventListener('input', () => applyGrowfaBackground(backgroundUrlInput.value || DEFAULT_GROWFA_BG, backgroundOverlayInput.value, false));
 const resetBackgroundBtn = document.getElementById('resetBackgroundBtn');
-if (resetBackgroundBtn) resetBackgroundBtn.addEventListener('click', () => { const saved = JSON.stringify({url:DEFAULT_GROWFA_BG, overlay:.78}); try { localStorage.setItem('growfaWebsiteBackground', saved); } catch (err) {} if (growfaCanSyncSharedContent()) void persistGrowfaContent('growfaWebsiteBackground', saved); applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); });
+if (resetBackgroundBtn) resetBackgroundBtn.addEventListener('click', async () => {
+  if (!growfaCanSyncSharedContent()) { alert('Please sign in to the GROWFA admin portal before resetting the shared background.'); return; }
+  const saved = JSON.stringify({url:DEFAULT_GROWFA_BG, overlay:.78});
+  applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, true);
+  const ok = await persistGrowfaContent('growfaWebsiteBackground', saved);
+  if (ok) alert('Default background saved to Supabase and shared with other devices.');
+});
 
 
 // Admin portal category navigation. Existing forms and their IDs remain unchanged.
