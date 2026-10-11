@@ -2366,13 +2366,89 @@ safeStorageSet('gtfa_about', JSON.stringify(defaultAbout));
 }
 }
 
+// Shared website content is stored in Supabase so every visitor sees the same published content.
+const GROWFA_SHARED_CONTENT_KEYS = ['gtfa_home', 'gtfa_about', 'gtfa_articles', 'gtfa_gallery', 'gtfa_plants', 'gtfa_books', 'growfaWebsiteBackground'];
+let growfaContentSyncInProgress = false;
+
+function growfaCanSyncSharedContent() {
+  return !!(growfaSupabase && growfaAdminSession && growfaAdminSession.user && growfaAdminSession.user.id);
+}
+
+async function growfaUploadDataUrls(value, prefix) {
+  if (typeof value === 'string') {
+    if (!value.startsWith('data:')) return value;
+    if (!growfaSupabase) throw new Error('Supabase is not configured.');
+    const response = await fetch(value);
+    const blob = await response.blob();
+    const extByType = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'application/pdf': 'pdf' };
+    const ext = extByType[blob.type] || 'bin';
+    const path = `${prefix}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    const { error: uploadError } = await growfaSupabase.storage.from('growfa-content').upload(path, blob, { contentType: blob.type || 'application/octet-stream', upsert: false });
+    if (uploadError) throw uploadError;
+    const { data } = growfaSupabase.storage.from('growfa-content').getPublicUrl(path);
+    if (!data || !data.publicUrl) throw new Error('Could not create a public URL for an uploaded asset.');
+    return data.publicUrl;
+  }
+  if (Array.isArray(value)) return Promise.all(value.map(item => growfaUploadDataUrls(item, prefix)));
+  if (value && typeof value === 'object') {
+    const output = {};
+    for (const [key, item] of Object.entries(value)) output[key] = await growfaUploadDataUrls(item, prefix);
+    return output;
+  }
+  return value;
+}
+
+async function persistGrowfaContent(key, rawValue) {
+  if (!GROWFA_SHARED_CONTENT_KEYS.includes(key) || !growfaCanSyncSharedContent()) return false;
+  try {
+    let parsed;
+    try { parsed = JSON.parse(rawValue); } catch (_) { parsed = rawValue; }
+    const remoteContent = await growfaUploadDataUrls(parsed, key.replace(/[^a-z0-9_-]/gi, '_'));
+    const { error } = await growfaSupabase.from('website_content').upsert({
+      content_key: key,
+      content: remoteContent,
+      updated_at: new Date().toISOString(),
+      updated_by: growfaAdminSession.user.id
+    }, { onConflict: 'content_key' });
+    if (error) throw error;
+    // Keep this browser in step with the normalized remote copy (including uploaded asset URLs).
+    try { localStorage.setItem(key, JSON.stringify(remoteContent)); } catch (_) {}
+    return true;
+  } catch (error) {
+    console.error('GROWFA shared content sync failed for ' + key + ':', error);
+    alert('Your change was saved in this browser, but could not be synced to the shared website. Please check your connection and Supabase permissions, then save again. Details: ' + (error.message || 'Unknown error'));
+    return false;
+  }
+}
+
+async function loadGrowfaSharedContent(options = {}) {
+  if (!growfaSupabase) return;
+  try {
+    const { data, error } = await growfaSupabase.from('website_content').select('content_key, content');
+    if (error) throw error;
+    const remote = new Map((data || []).map(row => [row.content_key, row.content]));
+    for (const key of GROWFA_SHARED_CONTENT_KEYS) {
+      if (remote.has(key)) {
+        const value = remote.get(key);
+        try { localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value)); } catch (_) {}
+      } else if (options.migrateMissing && growfaCanSyncSharedContent()) {
+        const localValue = safeStorageGet(key);
+        if (localValue !== null) await persistGrowfaContent(key, localValue);
+      }
+    }
+  } catch (error) {
+    console.error('GROWFA shared content could not be loaded from Supabase:', error);
+    // Keep the current browser content visible if the shared service is temporarily unavailable.
+  }
+}
+
 // Defensive helpers for browser-only storage. These do not replace a shared backend.
 function safeStorageGet(key) {
   try { return localStorage.getItem(key); }
   catch (error) { console.error('Unable to read local storage:', error); return null; }
 }
 function safeStorageSet(key, value) {
-  try { localStorage.setItem(key, value); return true; }
+  try { localStorage.setItem(key, value); if (GROWFA_SHARED_CONTENT_KEYS.includes(key) && growfaCanSyncSharedContent()) void persistGrowfaContent(key, value); return true; }
   catch (error) {
     console.error('Unable to save local storage:', error);
     alert('Your changes could not be saved in this browser. Storage may be full or unavailable. Please export/backup your content and try a smaller upload.');
@@ -2412,7 +2488,8 @@ let currentEditingType = null;
 let currentArticleViewMode = 'read'; // 'read' or 'download'
 
 // Initialize the website
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', async function() {
+await loadGrowfaSharedContent();
 initializeLocalStorage();
 loadWebsiteContent();
 createBackgroundElements();
@@ -2589,6 +2666,8 @@ loginBtn.addEventListener('click', async function() {
       throw new Error('This account is not assigned the GROWFA admin role.');
     }
     growfaAdminSession = data.session;
+    await loadGrowfaSharedContent({ migrateMissing: true });
+    loadWebsiteContent();
     loginModal.style.display = 'none';
     adminPortal.style.display = 'block';
     await loadAdminData();
@@ -2611,9 +2690,21 @@ document.getElementById('adminPassword').value = '';
 });
 
 // Update main website button
-updateMainBtn.addEventListener('click', function() {
-loadWebsiteContent();
-alert('Main website has been updated with all changes!');
+updateMainBtn.addEventListener('click', async function() {
+  if (!growfaCanSyncSharedContent()) { alert('Please sign in with a GROWFA admin account before publishing shared website changes.'); return; }
+  updateMainBtn.disabled = true;
+  const oldText = updateMainBtn.textContent;
+  updateMainBtn.textContent = 'Publishing…';
+  try {
+    for (const key of GROWFA_SHARED_CONTENT_KEYS) {
+      const value = safeStorageGet(key);
+      if (value !== null && !(await persistGrowfaContent(key, value))) throw new Error('One or more content items could not be synced. Please check the error message and try again.');
+    }
+    await loadGrowfaSharedContent();
+    loadWebsiteContent();
+    alert('Shared website content has been published to Supabase.');
+  } catch (error) { alert('Publishing failed: ' + (error.message || 'Unknown error')); }
+  finally { updateMainBtn.disabled = false; updateMainBtn.textContent = oldText; }
 });
 
 // Order form submission
@@ -4472,13 +4563,13 @@ function applyGrowfaBackground(url, overlay, persist) {
   if (backgroundUrlInput) backgroundUrlInput.value = safeUrl;
   if (backgroundOverlayInput) backgroundOverlayInput.value = String(amount);
   if (backgroundOverlayValue) backgroundOverlayValue.textContent = Math.round(amount * 100) + '%';
-  if (persist) { try { localStorage.setItem('growfaWebsiteBackground', JSON.stringify({url:safeUrl, overlay:amount})); } catch (err) { alert('Background applied for this visit, but browser storage is unavailable.'); } }
+  if (persist) { try { const saved = JSON.stringify({url:safeUrl, overlay:amount}); localStorage.setItem('growfaWebsiteBackground', saved); if (growfaCanSyncSharedContent()) void persistGrowfaContent('growfaWebsiteBackground', saved); } catch (err) { alert('Background applied for this visit, but browser storage is unavailable.'); } }
 }
 try { const savedBg = JSON.parse(localStorage.getItem('growfaWebsiteBackground') || 'null'); if (savedBg && savedBg.url) applyGrowfaBackground(savedBg.url, savedBg.overlay, false); else applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); } catch (err) { applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); }
 if (backgroundForm) backgroundForm.addEventListener('submit', function(e) { e.preventDefault(); const url = backgroundUrlInput.value.trim(); if (!/^https?:\/\//i.test(url)) { alert('Please enter a valid image URL beginning with https:// or http://.'); return; } applyGrowfaBackground(url, backgroundOverlayInput.value, true); alert('Background applied. It is saved in this browser only until Supabase is connected.'); });
 if (backgroundOverlayInput) backgroundOverlayInput.addEventListener('input', () => applyGrowfaBackground(backgroundUrlInput.value || DEFAULT_GROWFA_BG, backgroundOverlayInput.value, false));
 const resetBackgroundBtn = document.getElementById('resetBackgroundBtn');
-if (resetBackgroundBtn) resetBackgroundBtn.addEventListener('click', () => { try { localStorage.removeItem('growfaWebsiteBackground'); } catch (err) {} applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); });
+if (resetBackgroundBtn) resetBackgroundBtn.addEventListener('click', () => { const saved = JSON.stringify({url:DEFAULT_GROWFA_BG, overlay:.78}); try { localStorage.setItem('growfaWebsiteBackground', saved); } catch (err) {} if (growfaCanSyncSharedContent()) void persistGrowfaContent('growfaWebsiteBackground', saved); applyGrowfaBackground(DEFAULT_GROWFA_BG, .78, false); });
 
 
 // Admin portal category navigation. Existing forms and their IDs remain unchanged.
